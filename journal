@@ -1,3 +1,266 @@
+/***** НАСТРОЙКИ *****/
+const FOLDER_ID = "1ia0jrjmNj2P418kM3mBafFSzoxiSI5RU"; // ID вашей папки
+const SEARCH_SUBFOLDERS = true;   // искать в подпапках (если долго — можно поставить false)
+const MIN_TOKENS = 3;             // требуем минимум 3 слова (полное ФИО)
+const CACHE_TTL_SEC = 600;        // 10 минут
+const CHUNK_SIZE = 400;           // сколько записей в одном чанке кеша
+
+/***** ВХОД: WEB-API *****/
+function doGet(e) {
+  var p = (e && e.parameter) || {};
+  var action = String(p.action || "");
+  var cb = p.callback;
+
+  try {
+    if (action === "reindex") {
+      var idx = buildIndex_(); // пересобрать индекс вручную
+      return respond_({ ok: true, count: idx.length }, cb);
+    }
+
+    if (action === "search") {
+      var raw = String(p.q || "");
+      var qn = normalize_(raw);
+      var qTokens = tokens_(qn);
+
+      if (qTokens.length < MIN_TOKENS) {
+        return respond_(
+          { error: "need_full_name", message: "Введите полное ФИО (фамилия, имя, отчество)." },
+          cb
+        );
+      }
+
+      var idxAll = getIndex_(); // берём из кеша (или строим и кешируем)
+      var matches = searchMatches_(idxAll, qTokens, 50); // ограничим выдачу 50
+
+      // Преобразуем в формат фронта
+      var items = matches.map(function (it) {
+        return {
+          id: it.id,
+          name: it.name,
+          mimeType: it.mime,
+          modifiedTime: new Date(it.mtime).toISOString(),
+          webViewLink: "https://drive.google.com/file/d/" + it.id + "/view?usp=drivesdk",
+          pdfLink: buildPdfLink_(it.id, it.mime),
+          downloadLink: buildPdfLink_(it.id, it.mime)
+        };
+      });
+
+      return respond_({ query: qn, count: items.length, items: items }, cb);
+    }
+
+    // заглушка
+    return HtmlService.createHtmlOutput("OK");
+  } catch (err) {
+    return respond_({ error: "exception", message: String(err) }, cb);
+  }
+}
+
+/***** JSON / JSONP *****/
+function respond_(obj, callbackName) {
+  var text = JSON.stringify(obj);
+  if (callbackName) {
+    var body = String(callbackName) + "(" + text + ");";
+    return ContentService
+      .createTextOutput(body)
+      .setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  return ContentService
+    .createTextOutput(text)
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/***** НОРМАЛИЗАЦИЯ (ё/е + й/й + диакритика) *****/
+function normalize_(s) {
+  s = String(s || "").toLowerCase();
+
+  // ё -> е
+  s = s.replace(/ё/g, "е");
+
+  // ВАЖНО: лечим "й" как "и" + combining breve (й) и любые диакритики
+  // NFD разложит символы (й => и + ̆), затем мы убираем все combining marks
+  // и возвращаем обратно NFC.
+  try {
+    s = s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").normalize("NFC");
+  } catch (e) {
+    // если вдруг normalize недоступен — просто продолжаем (редко)
+  }
+
+  // пробелы
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+
+function normalizeName_(name) {
+  var n = String(name || "");
+
+  // убираем расширение .pdf / .docx / ...
+  n = n.replace(/\.[a-z0-9]+$/i, " ");
+
+  // заменяем мусорные символы на пробел (сохраняем буквы/цифры/пробелы)
+  n = n.replace(/[#_.,;:()\[\]\-]+/g, " ");
+
+  return normalize_(n);
+}
+
+function tokens_(s) {
+  var out = [];
+  var re = /[a-zа-яё]+|\d+/gi, m;
+  while ((m = re.exec(s)) !== null) {
+    var t = normalize_(m[0]);
+    if (t) out.push(t);
+  }
+  return out;
+}
+
+function matchScore_(nameNorm, qTokens) {
+  var posSum = 0, starts = 0;
+  for (var i = 0; i < qTokens.length; i++) {
+    var t = qTokens[i];
+    var idx = nameNorm.indexOf(t);
+    if (idx < 0) return { matched: false, score: 999999, startsCount: 0 };
+    posSum += idx;
+    if (idx === 0) starts++;
+  }
+  return { matched: true, score: posSum, startsCount: starts };
+}
+
+/***** ОБХОД ПАПКИ *****/
+function filesInFolder_(folder) {
+  var out = [];
+  var it = folder.getFiles();
+  while (it.hasNext()) out.push(it.next());
+  return out;
+}
+
+function filesInFolderRecursive_(folder) {
+  var out = filesInFolder_(folder);
+  var subs = folder.getFolders();
+  while (subs.hasNext()) out = out.concat(filesInFolderRecursive_(subs.next()));
+  return out;
+}
+
+/***** КЕШ ИНДЕКСА *****/
+function cacheKey_(suffix) { return "IDX_" + FOLDER_ID + "_" + suffix; }
+
+function getIndex_() {
+  var cache = CacheService.getScriptCache();
+  var manifestRaw = cache.get(cacheKey_("MANIFEST"));
+
+  if (manifestRaw) {
+    try {
+      var man = JSON.parse(manifestRaw); // {chunks:N, ts:...}
+      var all = [];
+      for (var i = 0; i < man.chunks; i++) {
+        var chunkRaw = cache.get(cacheKey_("CHUNK_" + i));
+        if (!chunkRaw) return buildIndex_(); // пропал кусок — пересобрать
+        all = all.concat(JSON.parse(chunkRaw));
+      }
+      return all;
+    } catch (e) {
+      return buildIndex_(); // битый кеш — пересобрать
+    }
+  }
+  return buildIndex_(); // кеша нет — собрать
+}
+
+function buildIndex_() {
+  var folder = DriveApp.getFolderById(FOLDER_ID);
+  var files = SEARCH_SUBFOLDERS ? filesInFolderRecursive_(folder) : filesInFolder_(folder);
+
+  var idx = [];
+  for (var i = 0; i < files.length; i++) {
+    var f = files[i];
+    try {
+      idx.push({
+        id: f.getId(),
+        name: f.getName(),
+        nameNorm: normalizeName_(f.getName()),
+        mime: f.getMimeType(),
+        mtime: f.getLastUpdated().getTime()
+      });
+    } catch (e) {
+      // пропускаем проблемный файл
+    }
+  }
+
+  var cache = CacheService.getScriptCache();
+  var chunks = Math.ceil(idx.length / CHUNK_SIZE);
+
+  for (var c = 0; c < chunks; c++) {
+    var part = idx.slice(c * CHUNK_SIZE, (c + 1) * CHUNK_SIZE);
+    cache.put(cacheKey_("CHUNK_" + c), JSON.stringify(part), CACHE_TTL_SEC);
+  }
+  cache.put(cacheKey_("MANIFEST"), JSON.stringify({ chunks: chunks, ts: Date.now() }), CACHE_TTL_SEC);
+
+  return idx;
+}
+
+/***** ПОИСК ПО ИНДЕКСУ *****/
+function searchMatches_(idxAll, qTokens, limit) {
+  var res = [];
+  for (var i = 0; i < idxAll.length; i++) {
+    var it = idxAll[i];
+    var ms = matchScore_(it.nameNorm, qTokens);
+    if (!ms.matched) continue;
+
+    res.push({
+      id: it.id, name: it.name, mime: it.mime, mtime: it.mtime,
+      _score: ms.score, _starts: ms.startsCount, _len: it.nameNorm.length
+    });
+  }
+
+  res.sort(function (a, b) {
+    if (b._starts !== a._starts) return b._starts - a._starts;
+    if (a._score !== b._score) return a._score - b._score;
+    if (a._len !== b._len) return a._len - b._len;
+    return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+  });
+
+  if (limit && res.length > limit) res = res.slice(0, limit);
+  return res;
+}
+
+/***** ССЫЛКИ НА PDF *****/
+function buildPdfLink_(id, mime) {
+  if (mime === "application/pdf") {
+    return "https://drive.google.com/uc?export=download&id=" + id;
+  }
+  if (mime === "application/vnd.google-apps.document") {
+    return "https://docs.google.com/document/d/" + id + "/export?format=pdf";
+  }
+  if (mime === "application/vnd.google-apps.spreadsheet") {
+    return "https://docs.google.com/spreadsheets/d/" + id + "/export?format=pdf";
+  }
+  if (mime === "application/vnd.google-apps.presentation") {
+    return "https://docs.google.com/presentation/d/" + id + "/export?format=pdf";
+  }
+  return "https://drive.google.com/uc?export=download&id=" + id;
+}
+
+function grantAnyoneInFolderRecursive() {
+  const root = DriveApp.getFolderById(FOLDER_ID);
+  let cnt = 0;
+
+  (function walk(folder){
+    const files = folder.getFiles();
+    while (files.hasNext()) {
+      const f = files.next();
+      try {
+        f.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        cnt++;
+      } catch (e) {
+        Logger.log("Не смогли расшарить: " + f.getName() + " — " + e);
+      }
+    }
+    const subs = folder.getFolders();
+    while (subs.hasNext()) walk(subs.next());
+  })(root);
+
+  Logger.log("Готово. Выдан доступ на файлов: " + cnt);
+}
+
+
+
 <!doctype html>
 <html lang="ru">
 <head>
@@ -7,7 +270,8 @@
   <style>
     :root{--bg:#0f172a;--card:#fff;--muted:#64748b;--primary:#2563eb}
     body{margin:0;font-family:system-ui,Segoe UI,Roboto,Inter,Arial;background:var(--bg);color:#0b1223;display:flex;flex-direction:column;min-height:100vh}
-    .wrap{flex:1;display:grid;place-items:start center;padding:24px}
+    .
+wrap{flex:1;display:grid;place-items:start center;padding:24px}
     .app{width:min(900px,100%);display:grid;gap:16px}
     header{position:relative;display:flex;align-items:center;justify-content:space-between;background:var(--card);border-radius:16px;padding:16px 20px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
     h1{margin:0;font-size:22px;line-height:1.3}
@@ -100,7 +364,8 @@
       const timeout = setTimeout(()=>{ cleanup(); reject(new Error("JSONP timeout")); }, 120000);
       function cleanup(){ clearTimeout(timeout); delete window[cb]; if (s.parentNode) s.parentNode.removeChild(s); }
       window[cb] = (data)=>{ cleanup(); resolve(data); };
-      s.onerror = ()=>{ cleanup(); reject(new Error("JSONP network error")); };
+      s.
+onerror = ()=>{ cleanup(); reject(new Error("JSONP network error")); };
       const sep = url.includes("?") ? "&" : "?";
       s.src = url + sep + "callback=" + cb + "&ts=" + Date.now();
       document.head.appendChild(s);
@@ -136,7 +401,7 @@
         const data = await jsonp(url);
 
         if(data.error){
-          out.innerHTML = `<div class="error">Ошибка: ${data.message || data.error}</div>`;
+          out.innerHTML = <div class="error">Ошибка: ${data.message || data.error}</div>;
           return;
         }
         if(!data.items || data.items.length===0){
@@ -157,7 +422,7 @@
         showMemoji();
 
       }catch(err){
-        out.innerHTML = `<div class="error">Сетевая ошибка: ${String(err)}</div>`;
+        out.innerHTML = <div class="error">Сетевая ошибка: ${String(err)}</div>;
       }finally{
         btn.disabled = false;
       }
