@@ -84,12 +84,26 @@
   <script>
     const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbxfj4JMsr7SiYxY2OMWuQhj6sYowiNcB5SArWrxj56yzoNOMe7IFkpZacHHZYSwb3qPHw/exec";
 
-    function norm(s){
-      return (s||"").toLowerCase()
-        .replace(/ё/g,"е")
-        .replace(/[#_.,;:()\\[\\]\\-]+/g," ")
-        .replace(/\\s+/g," ")
-        .trim();
+    function normalize_(s) {
+  s = String(s || "").toLowerCase();
+
+  // ё -> е
+  s = s.replace(/ё/g, "е");
+
+  // Unicode: й/й и любые диакритики
+  try {
+    s = s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").normalize("NFC");
+  } catch (e) {}
+
+  // Заменяем ВСЁ, кроме кириллицы/цифр/пробелов, на пробел
+  // (лечит латиницу, странные тире, неразрывные пробелы, точки и т.п.)
+  s = s.replace(/[^0-9а-я\s]/g, " ");
+
+  // Пробелы
+  s = s.replace(/\s+/g, " ").trim();
+
+  return s;
+}
     }
 
  function jsonp(url){
